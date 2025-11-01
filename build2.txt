@@ -1,0 +1,74 @@
+// ❌ Remove: import sun.security.tools.PathList   (not needed; causes issues)
+
+ThisBuild / version      := "0.1.0-SNAPSHOT"
+ThisBuild / scalaVersion := "2.12.18"          // Spark 3.5.x requires 2.12
+
+// ---- versions ----
+lazy val sparkV = "3.5.1"
+lazy val deltaV = "3.2.0"
+// Spark 3.5.1 is built against Hadoop 3.3.x; keep client libs aligned:
+lazy val hadoopV = "3.3.4"
+
+ThisBuild / dependencyOverrides +=
+  "jakarta.xml.bind" % "jakarta.xml.bind-api" % "2.3.3"
+
+ThisBuild / libraryDependencies ~= { _.map(_.exclude("javax.xml.bind", "jaxb-api")) }
+
+// ---- single-module project (one JAR) ----
+lazy val root = (project in file("."))
+  .settings(
+    name := "HW2",
+    Compile / mainClass := Some("ragPipeline.DriverMain"), // your entry point
+
+    libraryDependencies ++= Seq(
+
+      // Spark
+      "org.apache.spark" %% "spark-sql" % "3.5.1",
+       "org.apache.spark" %% "spark-core" % "3.5.1",
+
+      // Delta Lake
+      "io.delta" %% "delta-spark" % deltaV,
+
+      // Hadoop client libs (match Spark's 3.3.x line)
+      "org.apache.hadoop" % "hadoop-client" % hadoopV,
+      "org.apache.hadoop" % "hadoop-common" % hadoopV,
+      "org.apache.hadoop" % "hadoop-mapreduce-client-core" % hadoopV,
+
+      // Lucene
+      "org.apache.lucene" % "lucene-core"            % "9.10.0",
+      "org.apache.lucene" % "lucene-analysis-common" % "9.10.0",
+      "org.apache.lucene" % "lucene-queryparser"     % "9.10.0",
+      "org.apache.lucene" % "lucene-backward-codecs" % "9.10.0",
+
+      // Jackson
+      "com.fasterxml.jackson.core"   %  "jackson-core"        % "2.15.3",
+      "com.fasterxml.jackson.core"   %  "jackson-databind"    % "2.15.3",
+      "com.fasterxml.jackson.core"   %  "jackson-annotations" % "2.15.3",
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % "2.15.2",
+
+      // PDF/Text
+      "org.apache.pdfbox" % "pdfbox" % "2.0.31",
+      "org.apache.tika"   % "tika-core" % "2.9.2",
+      "org.apache.tika"   % "tika-parsers-standard-package" % "2.9.2",
+
+      // CSV
+      "org.apache.commons" % "commons-csv" % "1.11.0",
+
+      // JSON + HTTP (Circe + STTP)
+      "io.circe" %% "circe-core"    % "0.14.9",
+      "io.circe" %% "circe-generic" % "0.14.9",
+      "io.circe" %% "circe-parser"  % "0.14.9",       // needed for `io.circe.parser.parse`
+      "com.softwaremill.sttp.client3" %% "okhttp-backend" % "3.9.7",
+      "com.softwaremill.sttp.client3" %% "circe"         % "3.9.7",
+
+      // Logging (use logback at runtime; avoid slf4j-simple to prevent clashes)
+      "org.slf4j"      % "slf4j-api"       % "1.7.36",
+      "ch.qos.logback" % "logback-classic" % "1.5.6" % Runtime,
+
+      // Type safe
+      "com.typesafe" % "config" % "1.4.3",
+
+      // Tests
+      "org.scalatest" %% "scalatest" % "3.2.19" % Test
+    )
+  )
