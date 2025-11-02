@@ -18,6 +18,7 @@ import ragPipeline.config.AppConfig
 import ragPipeline.helper.{Chunker, Vectors}
 import ragPipeline.models.Ollama
 
+import scala.concurrent.duration._
 import scala.util.Try
 
 object IncrementalDatabasePipeline extends Serializable {
