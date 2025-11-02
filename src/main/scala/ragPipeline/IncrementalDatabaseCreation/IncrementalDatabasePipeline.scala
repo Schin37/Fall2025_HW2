@@ -420,6 +420,20 @@ object IncrementalDatabasePipeline extends Serializable {
             .filter(_ > 0)
             .getOrElse(math.max(1, AppConfig.embed.concurrency))
 
+        val readinessClient = new Ollama()
+        val waitReadySeconds =
+          sys.props
+            .get("rag.embed.waitReadySeconds")
+            .flatMap(v => Try(v.toInt).toOption)
+            .filter(_ > 0)
+            .getOrElse(60)
+
+        logger.info(
+          s"[Incremental] Waiting up to ${waitReadySeconds}s for Ollama at ${readinessClient.baseUrl} before embedding."
+        )
+        readinessClient.awaitReady(waitReadySeconds.seconds)
+        logger.info("[Incremental] Ollama embed server responded to readiness probe.")
+
         val targetPartitions = math.max(1, embeddingParallelism)
         val currentPartitions = toEmbedDS.rdd.getNumPartitions
         val toEmbedDSLimited =
@@ -437,51 +451,84 @@ object IncrementalDatabasePipeline extends Serializable {
         // Exact produced count via accumulator (no extra job)
         val accWritten = spark.sparkContext.longAccumulator("embeddingsWrittenAcc")
 //        spark.conf.set("spark.speculation", "false")
-        val embDS: Dataset[EmbRow] = toEmbedDSLimited.mapPartitions { rows =>
-          val client     = new Ollama()
-          val batchSize  =
-            sys.props
-              .get("rag.embed.batch")
-              .flatMap(v => Try(v.toInt).toOption)
-              .filter(_ > 0)
-              .getOrElse(math.max(1, AppConfig.embed.batchSize))
-          val throttleMs = sys.props.get("rag.embed.throttle.ms").map(_.toLong).getOrElse(0L)
+        val embedBatchSize =
+          sys.props
+            .get("rag.embed.batch")
+            .flatMap(v => Try(v.toInt).toOption)
+            .filter(_ > 0)
+            .getOrElse(math.max(1, AppConfig.embed.batchSize))
+        val embedThrottleMs = sys.props.get("rag.embed.throttle.ms").map(_.toLong).getOrElse(0L)
+        val embedKeepAlive  = sys.props.get("rag.embed.keepAlive").filter(_.nonEmpty).orElse(Some("15m"))
 
-          rows.grouped(batchSize).flatMap { group =>
-            val texts = group.map(_._3).toVector
+        val estimatedCalls =
+          if (plannedEmbCount == 0L) 0L else math.ceil(plannedEmbCount.toDouble / embedBatchSize.toDouble).toLong
 
-            // Best-effort retry around the batch to complement Ollama.scala internal retries
-            def embedBatchOnce(): Vector[Array[Float]] =
-              if (texts.nonEmpty) client.embed(texts).map(Vectors.l2Normalization) else Vector.empty
+        logger.info(
+          s"[Incremental] Embedding batchSize=$embedBatchSize throttleMs=$embedThrottleMs estimatedCalls=$estimatedCalls"
+        )
 
-            val vectors = try embedBatchOnce() catch {
-              case _: Throwable =>
-                // tiny backoff then a second try
-                Thread.sleep(math.min(2000L, math.max(throttleMs, 250L)))
-                embedBatchOnce()
+        def embedPartition(
+                             rows: Iterator[(String, String, String, Int, Long)],
+                             client: Ollama
+                           ): Iterator[EmbRow] = {
+          rows
+            .grouped(embedBatchSize)
+            .flatMap { group =>
+              val chunkBatch = group.toVector
+              val texts       = chunkBatch.map(_._3)
+
+              def embedBatchOnce(): Vector[Array[Float]] =
+                if (texts.nonEmpty)
+                  client.embed(texts, model = embedder, keepAlive = embedKeepAlive).map(Vectors.l2Normalization)
+                else Vector.empty
+
+              val vectors = try embedBatchOnce() catch {
+                case _: Throwable =>
+                  Thread.sleep(math.min(2000L, math.max(embedThrottleMs, 250L)))
+                  embedBatchOnce()
+              }
+
+              if (embedThrottleMs > 0) Thread.sleep(embedThrottleMs)
+
+              val now = Instant.now().toEpochMilli
+              val n   = math.min(chunkBatch.size, vectors.size)
+              accWritten.add(n.toLong)
+              (0 until n).iterator.map { i =>
+                val (docId, chunkId, _txt, chunkIx, _shard) = chunkBatch(i)
+                val vec = vectors(i)
+                EmbRow(
+                  embedder     = embedder,
+                  embVersion   = embVersion,
+                  docId        = docId,
+                  chunkId      = chunkId,
+                  chunkIx      = chunkIx,
+                  embedding    = vec,
+                  embDim       = vec.length,
+                  ingestedAt   = now
+                )
+              }
             }
+        }
 
-            if (throttleMs > 0) Thread.sleep(throttleMs)
+        val serialEmbedding =
+          sys.props
+            .get("rag.embed.serial")
+            .flatMap(v => Try(v.toBoolean).toOption)
+            .getOrElse(embeddingParallelism <= 1)
 
-            val now = Instant.now().toEpochMilli
-            val n       = math.min(group.size, vectors.size)
-            (0 until n).iterator.map { i =>
-              accWritten.add(1)
-              val (docId, chunkId, _txt, chunkIx, _shard) = group(i)
-              val vec   = vectors(i)
-              EmbRow(
-                embedder     = embedder,
-                embVersion   = embVersion,
-                docId        = docId,
-                chunkId      = chunkId,
-                chunkIx      = chunkIx,
-                embedding    = vec,
-                embDim       = vec.length,
-                ingestedAt   = now
-              )
+        val embDS: Dataset[EmbRow] =
+          if (serialEmbedding) {
+            logger.info("[Incremental] Serial embedding mode active (Spark partition work executes on the driver).")
+            val client = new Ollama()
+            val localRows = embedPartition(toEmbedDSLimited.collect().iterator, client).toVector
+            spark.createDataset(localRows)
+          } else {
+            logger.info("[Incremental] Parallel embedding mode active (mapPartitions with configured parallelism).")
+            toEmbedDSLimited.mapPartitions { rows =>
+              val client = new Ollama()
+              embedPartition(rows, client)
             }
           }
-        }
 
         val embDF = embDS
           .toDF()
