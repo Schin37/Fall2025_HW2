@@ -29,8 +29,11 @@ class Ollama(base: String = Ollama.detectBaseUrl()) {
   // then on each request:
   basicRequest.readTimeout(readMs.millis)
 
-  private val embedUrl = uri"$base/api/embed"
-  private val chatUrl  = uri"$base/api/chat"
+  val baseUrl: String = base
+
+  private val embedUrl     = uri"$base/api/embed"
+  private val chatUrl      = uri"$base/api/chat"
+  private val readinessUrl = uri"$base/api/tags"
 
   /** Return L2-normalized embeddings as arrays of Float. */
   def embed(
@@ -65,6 +68,35 @@ class Ollama(base: String = Ollama.detectBaseUrl()) {
       .body(ChatReq(model, messages, stream = false, options = options, keep_alive = Some("10m")))
       .response(asJson[ChatResp])
     sendWithRetry(req, attempts).message.content
+  }
+
+  /** Block until the Ollama server responds to a lightweight readiness probe. */
+  def awaitReady(
+                  timeout: FiniteDuration = 60.seconds,
+                  pollEvery: FiniteDuration = 2.seconds
+                ): Unit = {
+    val deadline = timeout.fromNow
+    var lastError: Throwable = null
+    while (deadline.hasTimeLeft) {
+      try {
+        val resp = basicRequest
+          .get(readinessUrl)
+          .readTimeout(pollEvery)
+          .response(asStringAlways)
+          .send(backend)
+
+        if (resp.code.isSuccess) return
+        lastError = new RuntimeException(s"Unexpected status ${resp.code} from $readinessUrl: ${resp.body}")
+      } catch {
+        case t: Throwable => lastError = t
+      }
+      Thread.sleep(pollEvery.toMillis)
+    }
+    throw new RuntimeException(
+      s"Ollama server at $baseUrl did not answer readiness probe within ${timeout.toSeconds} seconds.\n" +
+        "Start the server (e.g. 'ollama serve' or the desktop app) and ensure localhost:11434 is reachable.",
+      lastError
+    )
   }
 
   /** Retry helper with simple exponential backoff. */

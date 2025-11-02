@@ -48,6 +48,7 @@ object AppConfig {
   object embed {
     val concurrency = cfg.getInt("embed.concurrency")
     val batchSize   = cfg.getInt("embed.batchSize")
+    val serialMaxBatch = if (cfg.hasPath("embed.serialMaxBatch")) cfg.getInt("embed.serialMaxBatch") else 2
     val maxChars    = cfg.getInt("embed.maxChars")
     val minChunkChars = cfg.getInt("embed.minChunkChars")
   }
