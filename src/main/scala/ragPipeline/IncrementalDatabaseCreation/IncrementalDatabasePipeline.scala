@@ -14,8 +14,11 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.functions.broadcast
 import org.slf4j.LoggerFactory
 
+import ragPipeline.config.AppConfig
 import ragPipeline.helper.{Chunker, Vectors}
 import ragPipeline.models.Ollama
+
+import scala.util.Try
 
 object IncrementalDatabasePipeline extends Serializable {
 
@@ -408,9 +411,24 @@ object IncrementalDatabasePipeline extends Serializable {
             .as[(String, String, String, Int, Long)]
 
         // ---- Control parallel pressure toward the local Ollama embed server ----
-        // Limit how many Spark tasks call Ollama at once (default 1 for local CPU)
-        val embeddingParallelism = sys.props.get("rag.embedding.parallelism").map(_.toInt).getOrElse(1)
-        val toEmbedDSLimited = toEmbedDS.coalesce(math.max(1, embeddingParallelism))
+        // Limit how many Spark tasks call Ollama at once.
+        val embeddingParallelism =
+          sys.props
+            .get("rag.embedding.parallelism")
+            .flatMap(v => Try(v.toInt).toOption)
+            .filter(_ > 0)
+            .getOrElse(math.max(1, AppConfig.embed.concurrency))
+
+        val targetPartitions = math.max(1, embeddingParallelism)
+        val currentPartitions = toEmbedDS.rdd.getNumPartitions
+        val toEmbedDSLimited =
+          if (currentPartitions > targetPartitions) toEmbedDS.coalesce(targetPartitions)
+          else if (currentPartitions < targetPartitions) toEmbedDS.repartition(targetPartitions)
+          else toEmbedDS
+
+        logger.info(
+          s"[Incremental] Embedding parallelism target=$targetPartitions (current partitions=$currentPartitions)"
+        )
 
         // Count once before mapping; avoids re-pass later
         val plannedEmbCount: Long = toEmbedDS.count()
@@ -420,7 +438,12 @@ object IncrementalDatabasePipeline extends Serializable {
 //        spark.conf.set("spark.speculation", "false")
         val embDS: Dataset[EmbRow] = toEmbedDSLimited.mapPartitions { rows =>
           val client     = new Ollama()
-          val batchSize  = sys.props.get("rag.embed.batch").map(_.toInt).getOrElse(16)
+          val batchSize  =
+            sys.props
+              .get("rag.embed.batch")
+              .flatMap(v => Try(v.toInt).toOption)
+              .filter(_ > 0)
+              .getOrElse(math.max(1, AppConfig.embed.batchSize))
           val throttleMs = sys.props.get("rag.embed.throttle.ms").map(_.toLong).getOrElse(0L)
 
           rows.grouped(batchSize).flatMap { group =>
