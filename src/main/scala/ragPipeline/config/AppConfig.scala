@@ -45,6 +45,13 @@ object AppConfig {
     def useCosine: Boolean = similarity.equalsIgnoreCase("cosine")
   }
 
+  object embed {
+    val concurrency = cfg.getInt("embed.concurrency")
+    val batchSize   = cfg.getInt("embed.batchSize")
+    val maxChars    = cfg.getInt("embed.maxChars")
+    val minChunkChars = cfg.getInt("embed.minChunkChars")
+  }
+
   // -------- Chunking --------
   object chunking {
     val windowChars: Int    = cfg.getInt("chunking.windowChars")

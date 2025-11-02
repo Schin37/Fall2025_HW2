@@ -18,7 +18,7 @@ class Ollama(base: String = Ollama.detectBaseUrl()) {
   private val cfg = ConfigFactory.load().getConfig("app.models.ollama")
   private val modelName = if (cfg.hasPath("model")) cfg.getString("model") else AppConfig.models.chatModel
   private val connectMs = if (cfg.hasPath("connectMs")) cfg.getInt("connectMs") else 30000
-  private val readMs    = if (cfg.hasPath("readMs"))    cfg.getInt("readMs")    else 300000 // 5 min
+  private val readMs    = if (cfg.hasPath("readMs"))    cfg.getInt("readMs")    else 60000 // 5 min
   private val attempts  = if (cfg.hasPath("attempts"))  cfg.getInt("attempts")  else 3
 
   private val backend: SttpBackend[Identity, Any] =
@@ -46,6 +46,8 @@ class Ollama(base: String = Ollama.detectBaseUrl()) {
       .response(asJson[EmbedResp])
     sendWithRetry(req, attempts).embeddings.map(_.toArray)
   }
+
+
 
   /** Simple chat; returns assistant content. */
   def chat(
