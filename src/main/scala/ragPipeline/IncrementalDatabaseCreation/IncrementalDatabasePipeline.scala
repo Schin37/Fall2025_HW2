@@ -420,20 +420,6 @@ object IncrementalDatabasePipeline extends Serializable {
             .filter(_ > 0)
             .getOrElse(math.max(1, AppConfig.embed.concurrency))
 
-        val readinessClient = new Ollama()
-        val waitReadySeconds =
-          sys.props
-            .get("rag.embed.waitReadySeconds")
-            .flatMap(v => Try(v.toInt).toOption)
-            .filter(_ > 0)
-            .getOrElse(60)
-
-        logger.info(
-          s"[Incremental] Waiting up to ${waitReadySeconds}s for Ollama at ${readinessClient.baseUrl} before embedding."
-        )
-        readinessClient.awaitReady(waitReadySeconds.seconds)
-        logger.info("[Incremental] Ollama embed server responded to readiness probe.")
-
         val targetPartitions = math.max(1, embeddingParallelism)
         val currentPartitions = toEmbedDS.rdd.getNumPartitions
         val toEmbedDSLimited =
