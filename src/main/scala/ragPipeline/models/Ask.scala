@@ -15,7 +15,7 @@ object Ask {
   // Use config instead (fallbacks shown)
   private val MaxQuestionChars: Int = 300
   private val MaxContextChars:  Int =
-    Try(AppConfig.chunking.maxContextBlock).getOrElse(9000)  // match your application.conf
+    Try(AppConfig.chunking.maxContextBlock).getOrElse(2048)  // match your application.conf
 
   /** Build robust messages: system guardrail + one user turn with a trimmed context. */
   def buildMessages(question: String, context: String): Vector[ChatMessage] = {

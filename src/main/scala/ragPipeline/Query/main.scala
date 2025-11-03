@@ -3,13 +3,13 @@ package ragPipeline.Query
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.slf4j.LoggerFactory
-
 import ragPipeline.models.OllamaJson.ChatMessage
 import ragPipeline.models.{Ask, Ollama}
 import ragPipeline.config.AppConfig
 
 import scala.util.Try
 import org.apache.hadoop.fs.{FileSystem, Path => HPath}
+import ragPipeline.config.AppConfig.query.perChunkCap
 
 /** Spark-based RAG query that reads the HW2 incremental snapshot.
  *
@@ -141,11 +141,20 @@ object QueryMain {
     val scored =
       df.withColumn("embedding_d", toDouble(col("embedding")))
         .withColumn("score", cosSim(col("embedding_d")))
+        // normalize & trim text BEFORE driver collect
+        .withColumn("chunkText_norm", regexp_replace(col("chunkText"), "\\s+", " "))
+        .withColumn("chunkText_half", expr(s"substring(chunkText_norm, 1, $perChunkCap)"))
         .orderBy(col("score").desc)
         .limit(topK)
         .cache()
 
-    val top = scored.select($"docId", $"title", $"sectionPath", $"chunkText", $"score")
+    val top = scored.select(
+        $"docId",
+        $"title",
+        $"sectionPath",
+        $"chunkText_half".as("chunkText"),
+        $"score"
+      )
       .as[(String, String, String, String, Double)]
       .collect()
       .toVector
