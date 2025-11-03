@@ -13,6 +13,11 @@ import ragPipeline.config.AppConfig.query.perChunkCap
 
 /** Spark-based RAG query that reads the HW2 incremental snapshot.
  *
+ * The class performs three logical stages:
+ *   1. Resolve and load the published retrieval index (table or Parquet path).
+ *   2. Embed the incoming question and score cosine similarity against chunk embeddings.
+ *   3. Stitch the top-K chunks into a context string before calling the chat model.
+ *
  * Priority for locating the retrieval snapshot:
  *   1) -Drag.indexTable=rag.retrieval_index
  *   2) -Drag.indexPath=/abs/or/relative/path/to/out/retrieval_index
@@ -48,6 +53,9 @@ object QueryMain {
     val embedModel = sys.props.getOrElse("rag.embedModel", AppConfig.models.embedModel)
     val chatModel  = sys.props.getOrElse("rag.chatModel",  AppConfig.models.chatModel)
 
+    // Query mode is intentionally light-weight: build a single Spark session per
+    // invocation so we can leverage Spark SQL for vector scoring without a
+    // long-lived cluster.
     val spark = SparkSession.builder()
       .appName(s"RAG Query (Spark) topK=$topK")
       .master(sys.props.getOrElse("spark.master", "local[*]")) // default local mode
@@ -80,6 +88,8 @@ object QueryMain {
     }
 
     // ---- 1) Load the published snapshot (priority order) ----
+    // Allow multiple ways to point at the retrieval snapshot to make the CLI
+    // easy to use across local and remote environments.
     val baseDF: DataFrame = (idxTable, idxPath, cfgIndexOpt, inferredOpt) match {
       case (Some(t), _, _, _) =>
         println(s"[Query] Reading table: $t")
@@ -117,6 +127,8 @@ object QueryMain {
 
     // ---- 2) Embed the question (Vector[String]) and broadcast ----
     val ollama = new Ollama()
+    // Embed the user question once and broadcast the vector so the cosine UDF
+    // can reuse it for every chunk in the DataFrame.
     val qEmbeds: Vector[Array[Float]] = ollama.embed(Vector(question), embedModel)
     val qVecF: Array[Float] = qEmbeds.headOption.getOrElse(Array.emptyFloatArray)
     if (qVecF.isEmpty) {
@@ -138,6 +150,8 @@ object QueryMain {
       }
     }
 
+    // Score each chunk by cosine similarity, trim text to keep the prompt
+    // bounded, and keep only the best matches before collecting to the driver.
     val scored =
       df.withColumn("embedding_d", toDouble(col("embedding")))
         .withColumn("score", cosSim(col("embedding_d")))
