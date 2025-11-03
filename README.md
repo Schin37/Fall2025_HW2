@@ -1,142 +1,98 @@
-# Retrieval-Augmented Generation (RAG) Incremental Pipeline
-**Author:** Simbarashe Chinomona
+# RAG Pipeline Homework 2
 
-This homework implements a **Spark-based incremental RAG pipeline** in **Scala**. It watches a PDF corpus, detects changes, **chunks** new pages, **embeds** them with **Ollama (`nomic-embed-text`)**, publishes **Parquet shards for retrieval**, and serves **top-K answers** through either the Spark query job or a MapReduce compatibility runner that calls **`llama3.1:8b`** for grounded responses.
+## Overview
+This project incrementally builds and queries a retrieval-augmented generation (RAG) index from a corpus of PDF documents. The `add-context` flow ingests new or updated PDFs, chunks their text, embeds each chunk with an Ollama embedding model, and publishes a Parquet snapshot optimized for similarity search. The `question` flow embeds a user query, retrieves the most similar chunks from the snapshot, and sends the compiled context plus the question to an Ollama chat model for answer generation.【F:src/main/scala/main.scala†L8-L104】【F:src/main/scala/ragPipeline/Query/main.scala†L1-L132】
 
----
+### Architecture
+1. **Change detection** – PDFs under `app.pdfRoot` are hashed to identify new or modified documents compared to the prior manifest.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L205-L268】
+2. **Text extraction & chunking** – Changed PDFs are parsed with PDFBox, normalized, and split into overlapping windows sized by `app.chunking.windowChars` and `app.chunking.overlapPct`.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L270-L356】
+3. **Embedding generation** – Newly produced chunks are embedded in batches through the Ollama HTTP API using the configured embedder model and version; vectors are L2-normalized before storage.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L380-L448】
+4. **Snapshot publishing** – Document metadata, chunks, embeddings, and the retrieval index are written to Parquet with deterministic partitioning so incremental runs only touch affected partitions.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L332-L351】【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L413-L452】【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L500-L526】
+5. **Querying** – Retrieval loads the Parquet index, scores cosine similarity against the broadcast query embedding, and submits the top-k context to the chat model for answer generation.【F:src/main/scala/ragPipeline/Query/main.scala†L61-L132】【F:src/main/scala/ragPipeline/Query/main.scala†L139-L199】
 
-## 1) Quick Start
+## Prerequisites
+- **Java**: JDK 11 or 17 (Spark 3.5.x supports either). Ensure `JAVA_HOME` is set.
+- **sbt**: 1.9+ to build and run the Scala project defined in `build.sbt` (Scala 2.12.18, Spark 3.5.1).【F:build.sbt†L1-L44】
+- **Apache Spark**: Included via sbt dependencies; no separate install is needed for local mode.
+- **Ollama**: Install and run the Ollama server so the pipeline can call the embedding and chat endpoints configured in `application.conf`.
+- **Models**: Pull the following Ollama models before running the pipeline:
+  - `nomic-embed-text` for embeddings.【F:src/main/resources/application.conf†L21-L28】
+  - `llama3.1:8b` for question answering.【F:src/main/resources/application.conf†L21-L37】
 
-### Prereqs
-- **Java 11 or 17** (set `JAVA_HOME`).
-- **sbt 1.9+** (Scala 2.12.18 project targeting Spark 3.5.1).【F:build.sbt†L1-L44】
-- **Apache Spark 3.5.x** (brought in via sbt when running locally).
-- **Hadoop client binaries** (Spark submits will look for `HADOOP_HOME` when targeting HDFS/S3).
-- **Ollama** daemon running on the machine (default `http://127.0.0.1:11434`).
-- **Models to pull before first run:**
-  ```bash
-  ollama pull nomic-embed-text
-  ollama pull llama3.1:8b
-  ```
-- **Corpus:** place PDFs in `data/MSRCorpus/` or pass `--pdfRoot` to point at a different directory.【F:src/main/resources/application.conf†L7-L37】
+Start the Ollama daemon (defaults to `http://127.0.0.1:11434`) before running any sbt commands that embed or chat. You can override the base URL and model names through `application.conf` or JVM system properties (e.g., `-Drag.embedModel=...`).【F:src/main/resources/application.conf†L29-L37】【F:src/main/scala/ragPipeline/Query/main.scala†L45-L58】
 
-### Build
+## Data Layout
+- **Input**: Place PDFs under the directory configured as `app.pdfRoot` (defaults to `data/MSRCorpus`).【F:src/main/resources/application.conf†L7-L14】
+- **Output root**: `app.outDir` (defaults to `out/`). The incremental builder creates:
+  - `out/doc_normalized/`: Document-level metadata partitioned by `(shard, docId)` and versioned append-only.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L332-L351】
+  - `out/chunks/`: Chunk text and boundaries partitioned by `(shard, docId)`.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L332-L351】
+  - `out/embeddings/`: Vector store partitioned by `(embedder, embVersion, shard, docId)` so multiple embedding versions can coexist.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L413-L452】
+  - `out/retrieval_index/`: Query-ready snapshot partitioned by `(shard, docId)` that joins the latest chunk metadata with embeddings.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L500-L526】
+  - `out/_manifest/`: File manifest storing size, mtime, and SHA-256 hashes for incremental change detection.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L185-L241】
+  - `out/_metrics/` & `out/run_metrics.csv`: Run metrics keeping the latest two runs for quick inspection.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L146】
+
+Each run only reprocesses PDFs whose content hash changed, minimizing redundant work and preserving historical versions of documents, chunks, and embeddings.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L205-L409】
+
+## Key Source Files
+- `src/main/scala/main.scala` – CLI entry point that parses `add-context` and `question` subcommands, injects configuration, and invokes the incremental builder or query runner.【F:src/main/scala/main.scala†L8-L104】
+- `src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala` – Orchestrates incremental ingest: manifest comparison, chunk extraction, embedding, and Parquet publishing for new or updated PDFs.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L526】
+- `src/main/scala/ragPipeline/helper/Chunker.scala` – Implements PDF text normalization, windowing, and overlap logic used during incremental updates.【F:src/main/scala/ragPipeline/helper/Chunker.scala†L1-L116】
+- `src/main/scala/ragPipeline/Query/main.scala` – Embeds user queries, retrieves similar chunks from the published snapshot, and streams LLM answers.【F:src/main/scala/ragPipeline/Query/main.scala†L26-L199】
+- `src/main/resources/application.conf` – Centralizes runtime configuration: PDF roots, output directories, model names, retrieval parameters, and Spark defaults.【F:src/main/resources/application.conf†L1-L47】
+
+## Building the Project
 ```bash
-sbt clean compile
+cd Fall2025_HW2
+sbt compile
 ```
+This downloads all Scala/Spark dependencies and ensures sources compile. Use `sbt test` to run the available unit tests.【F:build.sbt†L1-L44】
 
-### Test
+## Running the Incremental Builder (`add-context`)
+1. Ensure the Ollama server is running and the required models are pulled.
+2. Place PDFs under the configured `app.pdfRoot`.
+3. From the project root run:
+   ```bash
+   sbt "run -- add-context --pdfRoot <input_pdf_dir> --outDir <output_dir> [--reducers N]"
+   ```
+   - All flags are optional; defaults come from `application.conf`.
+   - `--pdfRoot` accepts local or S3/HDFS URIs supported by Hadoop.
+   - `--outDir` controls where the Parquet outputs, manifest, and metrics land.
+   - `--reducers` tunes Spark shuffle parallelism when running on a cluster.
+
+The driver ensures the local directories exist before Spark writes and then dispatches the incremental pipeline. Re-running the command only re-embeds changed PDFs, updates affected partitions, and refreshes the retrieval snapshot.【F:src/main/scala/main.scala†L16-L68】【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L205-L526】
+
+### Customizing via JVM Properties
+You can override configuration keys without editing `application.conf` by passing `-D` properties to sbt. For example:
+```bash
+sbt "-Drag.embedModel=mxbai-embed-large" "-Dspark.master=local[4]" "run -- add-context"
+```
+Available overrides include model names, output paths, top-k retrieval count, and Spark master URL.【F:src/main/scala/ragPipeline/Query/main.scala†L45-L83】【F:src/main/resources/application.conf†L7-L47】
+
+## Running Queries (`question`)
+After building the context database, ask questions with:
+```bash
+sbt "run -- question '<your question here>'"
+```
+- If you pass two or more arguments, the first is treated as the shards/output directory (e.g., `out/`), and the remaining text becomes the question.
+- At runtime the query job locates the retrieval snapshot in the following priority: `-Drag.indexTable`, `-Drag.indexPath`, `app.paths.retrievalIndexDir`, or `<shardsParent>/retrieval_index`.【F:src/main/scala/ragPipeline/Query/main.scala†L26-L112】
+- The job embeds the question via Ollama, computes cosine similarity against stored embeddings, prints the top-k context snippets, and streams the LLM answer to stdout.【F:src/main/scala/ragPipeline/Query/main.scala†L113-L199】
+
+To switch between Spark and a MapReduce implementation, set `app.engine` in `application.conf` (`spark` by default). The driver routes questions to the appropriate query engine automatically.【F:src/main/scala/main.scala†L30-L104】【F:src/main/resources/application.conf†L3-L6】
+
+## Conceptual Notes
+- **Incrementality**: The manifest plus SHA-256 hashing guarantees only changed PDFs trigger re-chunking and re-embedding, preserving throughput on large corpora.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L205-L409】
+- **Partition strategy**: Partitioning by shard and document ID keeps related rows co-located, enabling dynamic partition overwrite so incremental runs touch only the necessary Parquet partitions.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L332-L351】【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L500-L526】
+- **Vector store schema**: Embeddings include embedder identifiers and version tags so you can roll out new models alongside old ones without rewriting history.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L413-L452】
+- **Model integration**: The Ollama client centralizes HTTP calls for both embedding batches and chat completions, and the query path uses the same embedder to keep the vector space aligned.【F:src/main/scala/ragPipeline/models/Ollama.scala†L18-L150】【F:src/main/scala/ragPipeline/Query/main.scala†L45-L132】
+
+## Troubleshooting
+- **Ollama connection errors**: Confirm the daemon is running on the host specified by `app.models.ollama.baseUrl` and that the models are pulled locally.【F:src/main/resources/application.conf†L29-L37】
+- **Empty query embeddings**: The query job exits if the embedder returns an empty vector; double-check the embed model name and server logs.【F:src/main/scala/ragPipeline/Query/main.scala†L133-L158】
+- **Spark master**: For local development the default `local[*]` master is used; configure `-Dspark.master` when submitting to a cluster.【F:src/main/scala/ragPipeline/Query/main.scala†L71-L75】
+
+## Testing & Verification
+Run the automated suite with:
 ```bash
 sbt test
 ```
-
-### Interactive Run (prompted menu)
-```bash
-sbt clean compile run
-```
-When prompted choose `1` for **add-context** or `2` for **question**.【F:src/main/scala/main.scala†L25-L68】
-
-### 1️⃣ Publish / Refresh the Context Snapshot
-```bash
-sbt "run -- add-context --pdfRoot <path-to-pdfs> --outDir <output-root> [--reducers N]"
-```
-- Missing flags fall back to `application.conf` defaults (`data/MSRCorpus`, `out/`).【F:src/main/scala/main.scala†L50-L83】【F:src/main/resources/application.conf†L7-L37】
-- Each run hashes PDFs, only re-chunks changed documents, and repopulates affected Parquet partitions for documents, chunks, embeddings, and the retrieval index.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L185-L526】
-- Metrics for the most recent two runs land in `out/_metrics/` plus `out/run_metrics.csv` for quick inspection.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L146】
-
-### 2️⃣ Ask Questions Against the Snapshot
-```bash
-sbt "run -- question [<shards-parent>] <question text...>"
-```
-- If you pass only the question, the job looks in `out/retrieval_index/`. Provide a first argument to point at another snapshot directory.【F:src/main/scala/main.scala†L68-L103】【F:src/main/scala/ragPipeline/Query/main.scala†L15-L112】
-- Set JVM props to tweak behavior, e.g. `-Drag.topK=8`, `-Drag.indexPath=/path/to/retrieval_index`, `-Drag.embedModel=mxbai-embed-large`.
-- Answers print top-K supporting chunks followed by the llama response in the console.【F:src/main/scala/ragPipeline/Query/main.scala†L113-L199】
-
----
-
-## 2) Architecture & Data Flow
-
-### Phase A — Incremental Context Build
-```
-PDFs ──▶ Manifest scanner ──▶ Chunker ──▶ Ollama.embed ──▶ Parquet writers
-             │                     │                     ├─▶ out/chunks/
-             │                     │                     ├─▶ out/embeddings/
-             │                     │                     └─▶ out/retrieval_index/
-             └─▶ Tracks SHA-256 + size/mtime → skips unchanged docs
-```
-Key behaviors:
-- Manifest in `out/_manifest/` stores hashes and metadata for change detection.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L185-L332】
-- Chunking uses sliding windows (`windowChars`, `overlapPct`) to produce context-friendly spans.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L270-L356】
-- Embeddings are normalized, version-tagged, and partitioned by `(embedder, embVersion, shard, docId)` so you can roll out new models side-by-side.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L380-L452】
-- Retrieval snapshot joins the freshest chunks + embeddings into `out/retrieval_index/` for fast Spark reads.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L500-L526】
-
-### Phase B — Query & Answer
-```
-retrieval_index/ ─▶ Spark query job ─▶ cosine similarity ─▶ top-K context ─▶ Ask.scala ─▶ Ollama.chat
-```
-- The query job embeds the question, broadcasts the vector, and scores cosine similarity per chunk.【F:src/main/scala/ragPipeline/Query/main.scala†L61-L132】
-- Top-K hits are formatted with doc metadata, streamed to stdout, and fed into `Ask.buildMessages` before hitting the chat endpoint.【F:src/main/scala/ragPipeline/Query/main.scala†L133-L199】【F:src/main/scala/ragPipeline/models/Ask.scala†L1-L117】
-- Set `app.engine = "mr"` in `application.conf` to route questions through the MapReduce compatibility layer (`QueryEngineMapReducer`).【F:src/main/scala/main.scala†L34-L66】【F:src/main/resources/application.conf†L3-L6】
-
----
-
-## 3) Files to Focus On
-
-### Command Driver & Configuration
-- `src/main/scala/main.scala` — CLI entry point; wires add-context vs question modes and applies config overrides.【F:src/main/scala/main.scala†L8-L104】
-- `src/main/resources/application.conf` — Central defaults: directories, engine toggle, model names, chunk sizing, MR reducer counts.【F:src/main/resources/application.conf†L1-L75】
-
-### Incremental Pipeline (core of HW2)
-- `IncrementalDatabasePipeline.scala` — End-to-end incremental flow: manifest diff, chunk/embedding creation, Parquet publishing, metrics writing.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L1-L526】
-- `IncrementalHelper.scala` — Utility helpers reused across pipeline stages (manifest, hashing, Spark I/O).【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalHelper.scala†L1-L224】
-- `Embedder.scala` — Thin wrapper around Ollama embed API with batching, normalization, and back-off.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/Embedder.scala†L1-L189】
-- `IncrementalDatabasePipeline2.scala` / `IncrementalDatabasePipeline3.scala` — Iteration snapshots kept for reference; focus on `IncrementalDatabasePipeline.scala` for the final flow.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline2.scala†L1-L447】【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline3.scala†L1-L517】
-
-### Query Side
-- `Query/main.scala` — Spark retrieval job that loads Parquet snapshots, computes similarity, and prompts the chat model.【F:src/main/scala/ragPipeline/Query/main.scala†L1-L199】
-- `RelevantInfoMapReduce/` — Legacy MR jobs kept for grading; use when `app.engine = "mr"` or when targeting Hadoop clusters without Spark.【F:src/main/scala/ragPipeline/RelevantInfoMapReduce/ShardReducerRelevantInfo.scala†L1-L180】
-- `models/` (`Ollama.scala`, `Ask.scala`) — HTTP client + prompt construction for embedding and chat operations.【F:src/main/scala/ragPipeline/models/Ollama.scala†L18-L150】【F:src/main/scala/ragPipeline/models/Ask.scala†L1-L117】
-
-### Helpers
-- `helper/Chunker.scala` — Sliding-window chunk creation and text cleanup.【F:src/main/scala/ragPipeline/helper/Chunker.scala†L1-L116】
-- `helper/Vectors.scala` — Vector math utilities (normalization, distance helpers).【F:src/main/scala/ragPipeline/helper/Vectors.scala†L1-L112】
-- `helper/Pdf.scala` — PDF extraction using PDFBox with password handling and heuristics.【F:src/main/scala/ragPipeline/helper/Pdf.scala†L1-L168】
-
----
-
-## 4) Configuration Tips
-- Override any key without editing the file using JVM props: `sbt "-Drag.embedModel=mxbai-embed-large" "-Dspark.master=local[4]" "run -- add-context"`.【F:src/main/scala/ragPipeline/Query/main.scala†L33-L83】
-- `app.embed.batchSize` controls how many chunks per Ollama call; keep small if GPU RAM is limited.【F:src/main/resources/application.conf†L39-L52】
-- Tune `app.chunking.windowChars` & `overlapPct` to adjust context length vs coverage.【F:src/main/resources/application.conf†L38-L60】
-- Switch between Spark and MR execution by flipping `app.engine`. The driver automatically routes query requests accordingly.【F:src/main/scala/main.scala†L34-L66】
-
----
-
-## 5) Implementation Notes
-- **Incrementality**: SHA-256 + size/mtime manifest ensures only changed PDFs are reprocessed, keeping historical Parquet partitions intact.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L185-L332】
-- **Partition Strategy**: Parquet datasets partition on shard & docId to keep related records co-located and minimize rewrite scope.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L332-L526】
-- **Vector Storage**: Embeddings include `(embedder, embVersion)` columns so new models can roll out gradually.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L380-L452】
-- **Metrics & Logging**: `RunMetrics` append-only parquet + CSV snapshots make grading easy; logs default to INFO via Logback.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L146】【F:src/main/resources/application.conf†L70-L75】
-
----
-
-## 6) Troubleshooting
-- **Ollama connection errors** → Verify daemon is running on the host in `app.models.ollama.baseUrl` and models are pulled locally.【F:src/main/resources/application.conf†L29-L37】
-- **Empty question embedding** → The job exits early; double-check the embed model name or server logs.【F:src/main/scala/ragPipeline/Query/main.scala†L102-L159】
-- **Spark master issues** → Override with `-Dspark.master=local[*]` (default) or your cluster URL when submitting jobs.【F:src/main/scala/ragPipeline/Query/main.scala†L45-L83】
-- **Stale outputs** → Set `app.run.deleteOutputIfExists=false` for debugging; defaults to true so each incremental run refreshes partitions safely.【F:src/main/resources/application.conf†L90-L96】
-
----
-
-## 7) Example End-to-End Session
-```bash
-# 1) Build or refresh the snapshot (Spark local mode)
-sbt "run -- add-context --pdfRoot data/MSRCorpus --outDir out"
-
-# 2) Ask a question using the freshly built retrieval index
-sbt "run -- question out 'What evidence is there about bug prediction?'"
-
-# 3) Optional: Run unit tests
-sbt test
-```
-Outputs land in `out/` (manifest, metrics, Parquet shards) and the console prints both supporting passages and the final llama answer.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L526】【F:src/main/scala/ragPipeline/Query/main.scala†L113-L199】
+Additional manual verification includes inspecting the Parquet outputs under `out/` and reviewing the most recent run metrics CSV for ingest statistics.【F:src/main/scala/ragPipeline/IncrementalDatabaseCreation/IncrementalDatabasePipeline.scala†L57-L146】

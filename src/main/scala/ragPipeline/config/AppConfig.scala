@@ -65,6 +65,11 @@ object AppConfig {
     val NumShardBuckets: Int = cfg.getInt("chunking.NumShardBuckets")
   }
 
+  object query {
+    val perChunkCap: Int = cfg.getInt("query.perChunkCap")
+    val maxCtxChars: Int = cfg.getInt("query.maxCtxChars")
+  }
+
   // -------- MapReduce knobs --------
   object mr {
     val reducers: Int         = cfg.getInt("mr.reducers")
