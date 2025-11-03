@@ -43,6 +43,7 @@ object AppConfig {
     val vectorDim:  Int    = cfg.getInt("models.vectorDim")
     val similarity: String = cfg.getString("models.similarity") // "cosine" | "dot" | "l2"
     def useCosine: Boolean = similarity.equalsIgnoreCase("cosine")
+    val embVersion = "v1"
   }
 
   object embed {
@@ -50,6 +51,8 @@ object AppConfig {
     val batchSize   = cfg.getInt("embed.batchSize")
     val maxChars    = cfg.getInt("embed.maxChars")
     val minChunkChars = cfg.getInt("embed.minChunkChars")
+    val keepAlive = "30m"
+    val embVersion = "v1"
   }
 
   // -------- Chunking --------

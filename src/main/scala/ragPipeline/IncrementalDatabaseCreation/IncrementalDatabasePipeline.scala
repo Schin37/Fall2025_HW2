@@ -14,16 +14,12 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.functions.broadcast
 import org.slf4j.LoggerFactory
 
-import ragPipeline.config.AppConfig
 import ragPipeline.helper.{Chunker, Vectors}
 import ragPipeline.models.Ollama
 
-import scala.concurrent.duration._
-import scala.util.Try
-
 object IncrementalDatabasePipeline extends Serializable {
 
-  @transient private lazy val logger = LoggerFactory.getLogger(getClass)
+  @transient private lazy val logger = org.slf4j.LoggerFactory.getLogger(getClass)
 
   // ---------- Row types ----------
   final case class DocRow(
@@ -55,13 +51,13 @@ object IncrementalDatabasePipeline extends Serializable {
                            embedder: String,
                            embVersion: String,
                            docId: String,
+                           //                           contentHash: String,
                            chunkId: String,
                            chunkIx: Int,
                            embedding: Array[Float],
                            embDim: Int,
                            ingestedAt: Long
                          )
-
   // ---------- Metrics tracking (local or AWS) ----------
   final case class RunMetrics(
                                runAtIsoUtc: String,       // ISO UTC time for readability
@@ -118,6 +114,43 @@ object IncrementalDatabasePipeline extends Serializable {
     fs.rename(tmp, target)                           // replace with fresh write
   }
 
+  private def writeCsvFromMetricsParquet(
+                                          spark: SparkSession,
+                                          metricsPath: String,   // e.g. s"$outDir/_metrics"
+                                          targetCsv:   String    // e.g. s"$outDir/run_metrics.csv"
+                                        ): Unit = {
+    import org.apache.hadoop.fs.{FileSystem, Path}
+    import spark.implicits._
+
+    if (!pathExists(spark, metricsPath)) return
+
+    val df = spark.read.parquet(metricsPath)
+      .orderBy(col("runAtIsoUtc").desc)   // newest first
+      .limit(2)                           // keep previous + current
+
+    // write to temp dir then rename the single part file to the targetCsv path
+    val conf   = spark.sparkContext.hadoopConfiguration
+    val target = new Path(targetCsv)
+    val fs     = target.getFileSystem(conf)
+
+    // Ensure parent dir
+    Option(target.getParent).foreach(p => if (!fs.exists(p)) fs.mkdirs(p))
+
+    // Remove existing file if present
+    if (fs.exists(target)) fs.delete(target, false)
+
+    val tmp = new Path(target.getParent, s".metrics_tmp_${System.currentTimeMillis()}")
+    df.coalesce(1).write.mode(SaveMode.Overwrite).option("header","true").csv(tmp.toString)
+
+    val part = fs.listStatus(tmp).map(_.getPath)
+      .find(p => p.getName.startsWith("part-") && p.getName.endsWith(".csv"))
+      .getOrElse(throw new RuntimeException(s"No CSV part file found in $tmp"))
+
+    fs.rename(part, target)
+    fs.delete(tmp, true)
+  }
+
+  /** Write a single CSV file (not a folder) by writing to a temp dir then renaming the part file. */
   /** Write a single CSV file (not a folder) by writing to a temp dir then renaming the part file. */
   private def saveSingleCsv(
                              df: org.apache.spark.sql.DataFrame,
@@ -162,19 +195,21 @@ object IncrementalDatabasePipeline extends Serializable {
     // Clean temp directory
     fs.delete(tmpPath, true)
   }
-
   // ---------- Paths ----------
   private case class OutPaths(base: String) {
-    val docsPath   = s"$base/doc_normalized"   // versioned (append)
-    val chunksPath = s"$base/chunks"           // versioned (append)
-    val embedsPath = s"$base/embeddings"       // versioned (append)
-    val indexPath  = s"$base/retrieval_index"  // snapshot (overwrite)
-    val manifestPath = s"$base/_manifest"      // last-seen (uri,length,mtime,sha)
+    val docsPath  = s"$base/doc_normalized"   // versioned (append)
+    val chunksPath= s"$base/chunks"           // versioned (append)
+    val embedsPath= s"$base/embeddings"       // versioned (append)
+    val indexPath = s"$base/retrieval_index"  // snapshot (overwrite)
+    // Track last-seen (uri, length, mtime) so we can skip re-reading bytes
+    val manifestPath = s"$base/_manifest"
   }
+
+
 
   // ---------- Public entry point ----------
   /**
-   * @param embedder     logical embedder name (e.g. "mxbai-embed-large")
+   * @param embedder     logical embedder name (e.g. "ollama:nomic-embed-text")
    * @param embVersion   your internal version string for the embedder + preprocessing (e.g. "v1")
    * @param shardBuckets number of shard buckets for partitioning (doc-affinity)
    */
@@ -182,27 +217,29 @@ object IncrementalDatabasePipeline extends Serializable {
            spark: SparkSession,
            pdfRoot: String,
            outDir: String,
-           embedder: String   = "mxbai-embed-large",
+           embedder: String   = "ollama:nomic-embed-text",
            embVersion: String = "v1",
            shardBuckets: Int  = 64
          ): Unit = {
     import spark.implicits._
+    import java.nio.file.{Files, Paths => JPaths}
+    import java.security.MessageDigest
 
     val t0 = nowMs()
 
     val paths = OutPaths(outDir)
     logger.info(s"[Incremental] START  pdfRoot=$pdfRoot  outDir=$outDir  embedder=$embedder/$embVersion")
 
-    // Local dev speed knobs (harmless on EMR; tune as needed)
+    // Better small files layout + dyn overwrite
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-    spark.conf.set("spark.sql.shuffle.partitions", sys.props.getOrElse("spark.sql.shuffle.partitions", "8"))
-    spark.conf.set("spark.default.parallelism",  sys.props.getOrElse("spark.default.parallelism",  "8"))
-    spark.conf.set("spark.sql.files.maxPartitionBytes", sys.props.getOrElse("spark.sql.files.maxPartitionBytes", (64L * 1024 * 1024).toString))
 
-    // ---------- 1) Detect new or changed PDFs (fast prefilter, then hash only candidates) ----------
+    // 1) Detect new or changed PDFs (by mtime/size)
+    // 1) Detect new or changed PDFs (fast prefilter by size/mtime, then hash only candidates)
     val conf = spark.sparkContext.hadoopConfiguration
 
+    // List all PDFs with (uri, length, mtime)
     val statsNow = hdfsListFiles(spark, pdfRoot)
+    import spark.implicits._
     val statsNowDF = statsNow.toDF // columns: uri,length,mtime
 
     // Load previous manifest (may be empty or missing sha256 on first run)
@@ -211,6 +248,7 @@ object IncrementalDatabasePipeline extends Serializable {
         val df = spark.read.parquet(paths.manifestPath)
         if (df.columns.contains("sha256")) df else df.withColumn("sha256", lit(""))
       } else {
+        // empty with expected schema
         statsNowDF.withColumn("sha256", lit("")).limit(0)
       }
 
@@ -218,16 +256,17 @@ object IncrementalDatabasePipeline extends Serializable {
     val candidatesURIs: Vector[String] =
       statsNowDF.as("cur")
         .join(prevStatsDF.select("uri","length","mtime").as("prev"), Seq("uri"), "left")
-        .filter(col("prev.uri").isNull || (col("cur.length") =!= col("prev.length") || col("cur.mtime") =!= col("prev.mtime")))
+        .filter( col("prev.uri").isNull ||
+          (col("cur.length") =!= col("prev.length") || col("cur.mtime") =!= col("prev.mtime")) )
         .select(col("uri")).as[String].collect().toVector
 
-    // Helper: streaming SHA-256 via Hadoop FS
+    // Helper: streaming SHA-256 via Hadoop FS (safe for spaces, S3, HDFS)
     def sha256ForUri(u: String): String = {
       val md = java.security.MessageDigest.getInstance("SHA-256")
       val p  = new org.apache.hadoop.fs.Path(u)
       val fs = p.getFileSystem(conf)
       val in = fs.open(p)
-      val buf = new Array[Byte](8 * 1024)  // sized buffer
+      val buf = new Array[Byte](8 * 1024)  // <-- FIX: give the buffer a size
       try {
         var n = in.read(buf)
         while (n > 0) { md.update(buf, 0, n); n = in.read(buf) }
@@ -237,15 +276,15 @@ object IncrementalDatabasePipeline extends Serializable {
 
     // Compute hashes ONLY for candidates
     val candWithHash = candidatesURIs.map { u =>
-      val s = statsNow.find(_.uri == u).get
+      val s = statsNow.find(_.uri == u).get // safe: u came from statsNow
       (u, s.length, s.mtime, sha256ForUri(u))
     }.toDF("uri","length","mtime","sha256")
 
-    // Join to prev with sha to decide true "changed"
+    // Join to prev with sha to decide true “changed”
     val changedUris: Vector[String] =
       candWithHash.as("cur")
         .join(prevStatsDF.select("uri","sha256").as("prev"), Seq("uri"), "left")
-        .filter(col("prev.uri").isNull || col("cur.sha256") =!= col("prev.sha256"))
+        .filter( col("prev.uri").isNull || col("cur.sha256") =!= col("prev.sha256") )
         .select("uri").as[String].collect().toVector
 
     val fileCount = statsNow.length.toLong
@@ -264,11 +303,19 @@ object IncrementalDatabasePipeline extends Serializable {
         spark.emptyDataset[(String, Array[Byte])]
       }
 
+
+
+
+
+
+
+
+    //    val fileCount = raw.count()
     logger.info(s"[Incremental] Found $fileCount PDFs under $pdfRoot")
 
     val acc = spark.sparkContext.longAccumulator("pdfsProcessed")
 
-    // ---------- 2) Extract text on executors ----------
+    // 2) Extract text on executors
     val docsDS: Dataset[DocRow] = raw.mapPartitions { it =>
       val stripper = new PDFTextStripper()
       stripper.setSortByPosition(true)
@@ -314,30 +361,31 @@ object IncrementalDatabasePipeline extends Serializable {
         }
       }
     }
-    val docsDF = docsDS.toDF()
 
-    // ---------- 3) Delta detection (docId, contentHash) ----------
-    val candDocIds: Array[String] = docsDF.select("docId").distinct().as[String].collect()
-
+    // 3) Delta detection (docId, contentHash)
     val existingKeys: DataFrame =
-      if (pathExists(spark, paths.docsPath) && candDocIds.nonEmpty)
-        spark.read.parquet(paths.docsPath)
-          .where(col("docId").isin(candDocIds: _*)) // narrow to only these docIds
-          .select("docId", "contentHash").distinct()
+      if (pathExists(spark, paths.docsPath))
+        spark.read.parquet(paths.docsPath).select("docId", "contentHash").distinct()
       else emptyDocsDeltaFrame(spark)
+
+    val docsDF = docsDS.toDF()
 
     val toProcessDF =
       if (existingKeys.isEmpty) docsDF
       else docsDF.join(broadcast(existingKeys), Seq("docId", "contentHash"), "left_anti")
 
-    val hasWork = !toProcessDF.head(1).isEmpty // cheaper emptiness probe
+    val hasWork = toProcessDF.take(1).nonEmpty
+
 
     val changedDocIds: Array[String] =
       if (hasWork) toProcessDF.select("docId").distinct().as[String].collect()
       else Array.empty[String]
 
-    // ---------- 4) Chunk & write versions (append) ----------
-    if (hasWork) {
+
+
+    // this makes sure that in the event that this exists
+    if(hasWork) {
+      // 4) Deterministic chunking
       val chunkedDF: DataFrame = toProcessDF.as[DocRow].mapPartitions { it =>
         it.flatMap { doc =>
           val pieces = Chunker.split(doc.text)
@@ -347,7 +395,7 @@ object IncrementalDatabasePipeline extends Serializable {
             val end   = if (start >= 0) start + piece.length else -1
             if (start >= 0) {
               cursor = end
-              val cid = sha256Hex(s"${doc.docId}:$start:$end:${doc.contentHash}")
+              val cid = sha256Hex(s"${doc.docId}:${start}:${end}:${doc.contentHash}")
               Some(ChunkRow(
                 doc.docId, doc.contentHash, doc.uri, doc.title, doc.language,
                 ix, start, end, piece, s"/p=$ix", cid, doc.ingestedAt
@@ -357,6 +405,8 @@ object IncrementalDatabasePipeline extends Serializable {
         }
       }.toDF()
 
+      // 4.1) Write versioned docs/chunks (append; keep history)
+      // Use LONG shard to match Spark BIGINT
       val docsOut =
         toProcessDF
           .drop("text")
@@ -365,7 +415,6 @@ object IncrementalDatabasePipeline extends Serializable {
       val chunksOut =
         chunkedDF
           .withColumn("shard", pmod(xxhash64(col("docId")), lit(shardBuckets.toLong)))
-          .persist()
 
       // Append versions (keep history)
       docsOut
@@ -386,7 +435,9 @@ object IncrementalDatabasePipeline extends Serializable {
 
       logger.info("[Incremental] Wrote new doc/chunk versions.")
 
-      // ---------- 5) Select missing vectors (only for changed docIds) ----------
+      // =========================
+      // 5) SELECT MISSING VECTORS
+      // =========================
       val existingEmbKeys: DataFrame =
         if (pathExists(spark, paths.embedsPath))
           spark.read.parquet(paths.embedsPath)
@@ -401,78 +452,33 @@ object IncrementalDatabasePipeline extends Serializable {
         if (existingEmbKeys.isEmpty) candChunks
         else candChunks.join(broadcast(existingEmbKeys), Seq("docId", "chunkId"), "left_anti")
 
-      if (!chunksNeedingVecs.head(1).isEmpty) {
+      if (chunksNeedingVecs.take(1).nonEmpty) {
         val toEmbedDS =
           chunksNeedingVecs
             .join(
               chunksOut.select($"docId", $"chunkId", $"chunkText"),
               Seq("docId", "chunkId")
             )
+            // NOTE: shard typed as Long here
             .select($"docId", $"chunkId", $"chunkText", $"chunkIx", $"shard")
             .as[(String, String, String, Int, Long)]
 
-        // ---- Control parallel pressure toward the local Ollama embed server ----
-        // Limit how many Spark tasks call Ollama at once.
-        val embeddingParallelism =
-          sys.props
-            .get("rag.embedding.parallelism")
-            .flatMap(v => Try(v.toInt).toOption)
-            .filter(_ > 0)
-            .getOrElse(math.max(1, AppConfig.embed.concurrency))
-
-        val targetPartitions = math.max(1, embeddingParallelism)
-        val currentPartitions = toEmbedDS.rdd.getNumPartitions
-        val toEmbedDSLimited =
-          if (currentPartitions > targetPartitions) toEmbedDS.coalesce(targetPartitions)
-          else if (currentPartitions < targetPartitions) toEmbedDS.repartition(targetPartitions)
-          else toEmbedDS
-
-        logger.info(
-          s"[Incremental] Embedding parallelism target=$targetPartitions (current partitions=$currentPartitions)"
-        )
-
-        // Count once before mapping; avoids re-pass later
-        val plannedEmbCount: Long = toEmbedDS.count()
-
-        // Exact produced count via accumulator (no extra job)
-        val accWritten = spark.sparkContext.longAccumulator("embeddingsWrittenAcc")
-//        spark.conf.set("spark.speculation", "false")
-        val embDS: Dataset[EmbRow] = toEmbedDSLimited.mapPartitions { rows =>
-          val client     = new Ollama()
-          val batchSize  =
-            sys.props
-              .get("rag.embed.batch")
-              .flatMap(v => Try(v.toInt).toOption)
-              .filter(_ > 0)
-              .getOrElse(math.max(1, AppConfig.embed.batchSize))
-          val throttleMs = sys.props.get("rag.embed.throttle.ms").map(_.toLong).getOrElse(0L)
-
+        val embDS: Dataset[EmbRow] = toEmbedDS.mapPartitions { rows =>
+          val client    = new Ollama()
+          val batchSize = 64
           rows.grouped(batchSize).flatMap { group =>
-            val texts = group.map(_._3).toVector
-
-            // Best-effort retry around the batch to complement Ollama.scala internal retries
-            def embedBatchOnce(): Vector[Array[Float]] =
-              if (texts.nonEmpty) client.embed(texts).map(Vectors.l2Normalization) else Vector.empty
-
-            val vectors = try embedBatchOnce() catch {
-              case _: Throwable =>
-                // tiny backoff then a second try
-                Thread.sleep(math.min(2000L, math.max(throttleMs, 250L)))
-                embedBatchOnce()
-            }
-
-            if (throttleMs > 0) Thread.sleep(throttleMs)
-
-            val now = Instant.now().toEpochMilli
+            val texts   = group.map(_._3).toVector
+            val vectors = if (texts.nonEmpty) client.embed(texts).map(Vectors.l2Normalization) else Vector.empty
+            val now     = Instant.now().toEpochMilli
             val n       = math.min(group.size, vectors.size)
             (0 until n).iterator.map { i =>
-              accWritten.add(1)
               val (docId, chunkId, _txt, chunkIx, _shard) = group(i)
               val vec   = vectors(i)
               EmbRow(
                 embedder     = embedder,
                 embVersion   = embVersion,
                 docId        = docId,
+                //                contentHash  = "", // filled on join below
                 chunkId      = chunkId,
                 chunkIx      = chunkIx,
                 embedding    = vec,
@@ -502,33 +508,43 @@ object IncrementalDatabasePipeline extends Serializable {
           .partitionBy("embedder", "embVersion", "shard", "docId")
           .parquet(paths.embedsPath)
 
-        logger.info(s"[Incremental] Planned up to $plannedEmbCount embeddings; wrote ${accWritten.value} for $embedder/$embVersion.")
+        logger.info(s"[Incremental] Wrote ${embDF.count()} new embeddings for $embedder/$embVersion.")
       } else {
         logger.info(s"[Incremental] No missing vectors for $embedder/$embVersion.")
       }
-
-      chunksOut.unpersist()
-    } else {
+    }
+    else{
       logger.info("[Incremental] No content changes detected. Nothing to do.")
     }
 
-    // ---------- 7) MATERIALIZE SNAPSHOT INDEX (incremental by docId) ----------
+
+
+    // =========================
+    // 7) MATERIALIZE SNAPSHOT INDEX
+    // =========================
     if (changedDocIds.nonEmpty) {
       buildAndPublishIndex(spark, paths, embedder, embVersion, changedDocIds)
     }
 
-    // ---------- Update manifest ----------
+    // Update manifest so next run can skip unchanged files cheaply
     val manifestDF =
       statsNowDF
-        .join(prevStatsDF.select($"uri".as("p_uri"), $"sha256".as("prevSha")), statsNowDF("uri") === col("p_uri"), "left")
+        .join(prevStatsDF.select($"uri".as("p_uri"), $"sha256".as("prevSha")),
+          statsNowDF("uri") === col("p_uri"), "left")
         .drop("p_uri")
-        .join(candWithHash.select($"uri".as("c_uri"), $"sha256".as("newSha")), statsNowDF("uri") === col("c_uri"), "left")
+        .join(
+          candWithHash.select($"uri".as("c_uri"), $"sha256".as("newSha")),
+          statsNowDF("uri") === col("c_uri"), "left"
+        )
         .withColumn("sha256", coalesce(col("newSha"), col("prevSha"), lit("")))
         .select("uri","length","mtime","sha256")
 
     manifestDF.write.mode(SaveMode.Overwrite).parquet(paths.manifestPath)
 
-    // ---------- 8) METRICS (avoid global scans when no work) ----------
+    // =========================
+    // 8) VERIFY DELTA BEHAVIOR + METRICS
+    // =========================
+
     val numChunksWritten: Long =
       if (hasWork && pathExists(spark, paths.chunksPath))
         spark.read.parquet(paths.chunksPath).filter(col("ingestedAt") >= t0).count()
@@ -536,11 +552,13 @@ object IncrementalDatabasePipeline extends Serializable {
 
     val numEmbeddingsWritten: Long =
       if (hasWork && pathExists(spark, paths.embedsPath))
-        spark.read.parquet(paths.embedsPath).filter(col("ingestedAt") >= t0).count()
+        spark.read.parquet(paths.embedsPath)
+          .filter(col("ingestedAt") >= t0)
+          .count()
       else 0L
 
     val numIndexRows: Long =
-      if (hasWork && pathExists(spark, paths.indexPath))
+      if (pathExists(spark, paths.indexPath))
         spark.read.parquet(paths.indexPath).count()
       else 0L
 
@@ -554,6 +572,7 @@ object IncrementalDatabasePipeline extends Serializable {
       durationMs           = nowMs() - t0
     )
 
+    // -- write metrics parquet window first
     writeTwoRowMetricsWindow(spark, s"$outDir/_metrics_parquet", metrics)
 
     spark.catalog.refreshByPath(s"$outDir/_metrics_parquet")
@@ -562,11 +581,14 @@ object IncrementalDatabasePipeline extends Serializable {
       .limit(2)
       .cache()
 
+    // force materialization so writer won't race with lingering deletes
     window2.count()
+
+    // -- write a single CSV file atomically (temp dir -> rename)
     saveSingleCsv(window2, s"$outDir/run_metrics.csv", overwrite = true)
     window2.unpersist()
 
-    logger.info(s"[pipeline] Metrics updated: $outDir/_metrics_parquet and $outDir/run_metrics.csv")
+    logger.info(s"[pipeline] Metrics updated: $outDir/_metrics (parquet) and $outDir/run_metrics.csv")
   }
 
   // ---------- Snapshot index (Step 7) ----------
@@ -575,26 +597,29 @@ object IncrementalDatabasePipeline extends Serializable {
                                     paths: OutPaths,
                                     embedder: String,
                                     embVersion: String,
-                                    changedDocIds: Array[String]
+                                    changedDocIds: Array[String]          // NEW
                                   ): Unit = {
     import spark.implicits._
     import org.apache.spark.sql.functions._
     import org.apache.spark.sql.SaveMode
 
-    if (changedDocIds.isEmpty) return
+
     if (!pathExists(spark, paths.docsPath) || !pathExists(spark, paths.chunksPath)) {
       logger.warn("[Index] Docs or Chunks do not exist yet. Skipping index build.")
       return
     }
 
+    // Ensure dynamic partition overwrite is on
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
     val docs   = spark.read.parquet(paths.docsPath)
     val chunks = spark.read.parquet(paths.chunksPath)
 
+    // Only rows for changed docIds
     val changedDocs   = docs.where(col("docId").isin(changedDocIds:_*))
     val changedChunks = chunks.where(col("docId").isin(changedDocIds:_*))
 
+    // Latest version for the changed docIds only
     val latestChangedDocs = changedDocs
       .withColumn("rn",
         row_number().over(
@@ -608,16 +633,18 @@ object IncrementalDatabasePipeline extends Serializable {
     val latestChangedChunks = latestChangedDocs
       .select($"docId".as("d_id"), $"contentHash".as("d_hash"), $"title", $"language", $"shard")
       .join(
-        changedChunks.select($"docId".as("c_id"), $"contentHash".as("c_hash"), $"chunkId", $"chunkIx", $"chunkText", $"sectionPath"),
+        changedChunks.select($"docId".as("c_id"), $"contentHash".as("c_hash"),
+          $"chunkId", $"chunkIx", $"chunkText", $"sectionPath"),
         $"d_id" === $"c_id" && $"d_hash" === $"c_hash"
       )
       .select(
         $"d_id".as("docId"),
         $"d_hash".as("contentHash"),
         $"title", $"language", $"shard",
-        $"chunkId", $"chunkIx", $"sectionPath", $"chunkText"
+        $"chunkId", $"chunkIx", $"chunkText", $"sectionPath"
       )
 
+    // Embeddings are already partitioned by (embedder, embVersion, shard, docId)
     if (!pathExists(spark, paths.embedsPath)) {
       logger.warn("[Index] Embeddings path not found; nothing to write for changed docs.")
       return
@@ -637,18 +664,20 @@ object IncrementalDatabasePipeline extends Serializable {
         $"embedding", $"embDim"
       )
 
+    // Overwrite ONLY the touched partitions
     changedIndexDF
       .repartition(col("shard"), col("docId"))
       .write
       .mode(SaveMode.Overwrite)
       .option("maxRecordsPerFile", 5000)
-      .partitionBy("shard","docId")
+      .partitionBy("shard","docId")                      // <<< partition by docId too
       .parquet(paths.indexPath)
 
     logger.info(s"[Index] Incrementally updated ${changedDocIds.length} docId(s) at ${paths.indexPath}")
   }
 
   // ---------- helpers ----------
+  // Lightweight file stat we can diff without reading bytes
   final case class FileStat(uri: String, length: Long, mtime: Long)
 
   private def hdfsListFiles(spark: SparkSession, root: String): Vector[FileStat] = {
@@ -671,6 +700,18 @@ object IncrementalDatabasePipeline extends Serializable {
     }
 
     listRec(new org.apache.hadoop.fs.Path(root))
+  }
+
+  private def emptyStatDF(spark: SparkSession): org.apache.spark.sql.DataFrame = {
+    import org.apache.spark.sql.types._
+    spark.createDataFrame(
+      spark.sparkContext.emptyRDD[org.apache.spark.sql.Row],
+      StructType(Seq(
+        StructField("uri",   StringType, nullable = false),
+        StructField("length",LongType,   nullable = false),
+        StructField("mtime", LongType,   nullable = false)
+      ))
+    )
   }
 
   private def sha256Hex(s: String): String = {
@@ -700,5 +741,22 @@ object IncrementalDatabasePipeline extends Serializable {
       ))
     )
 
+
   private def nowMs(): Long = java.time.Instant.now().toEpochMilli
+
+  private def writeMetrics(spark: SparkSession, metrics: RunMetrics, outDir: String): Unit = {
+    import spark.implicits._
+    // Append one row per run so you can graph/inspect later
+    Seq(metrics).toDF
+      .write
+      .mode("append")
+      .json(s"$outDir/_metrics")  // e.g. <root>/out/_metrics/*.json
+  }
+
+  private def fileExists(spark: SparkSession, path: String): Boolean = {
+    val conf = spark.sparkContext.hadoopConfiguration
+    val p    = new org.apache.hadoop.fs.Path(path)
+    val fs   = p.getFileSystem(conf)
+    fs.exists(p)
+  }
 }
