@@ -17,6 +17,21 @@ import org.slf4j.LoggerFactory
 import ragPipeline.helper.{Chunker, Vectors}
 import ragPipeline.models.Ollama
 
+/**
+ * Incremental builder that turns a directory of PDFs into the normalized
+ * retrieval snapshot consumed by the query path.  Each invocation performs a
+ * diff against a manifest of previously processed files, re-chunks only the
+ * documents whose bytes changed, embeds the new text slices, and finally
+ * rewrites the portion of the retrieval index that references those docs.
+ *
+ * The implementation is intentionally split into well named helpers so the
+ * happy-path of [[run]] reads like a high level flow:
+ *   1. discover changed PDFs by comparing size/mtime and SHA-256 hashes
+ *   2. extract text + chunk deterministically (stable chunkId generation)
+ *   3. persist new doc/chunk versions and generate missing embeddings
+ *   4. materialize only the touched partitions of the retrieval index
+ *   5. update lightweight run metrics for observability
+ */
 object IncrementalDatabasePipeline extends Serializable {
 
   @transient private lazy val logger = org.slf4j.LoggerFactory.getLogger(getClass)
@@ -291,6 +306,9 @@ object IncrementalDatabasePipeline extends Serializable {
     logger.info(s"[Incremental] Found $fileCount PDFs; candidates=${candidatesURIs.size}; changed=${changedUris.size}")
 
     // Read bytes ONLY for changed files (skip if none)
+    // At this point we have an explicit list of changed URIs.  Only those are
+    // re-read via Spark's binaryFile source which keeps the IO footprint low
+    // even when the PDF tree is large.
     val raw: Dataset[(String, Array[Byte])] =
       if (changedUris.nonEmpty) {
         logger.info(s"[Incremental] Reading ${changedUris.size} new/changed PDFs...")
@@ -316,6 +334,9 @@ object IncrementalDatabasePipeline extends Serializable {
     val acc = spark.sparkContext.longAccumulator("pdfsProcessed")
 
     // 2) Extract text on executors
+    // Text extraction happens per-partition so that expensive PDFBox state is
+    // reused for multiple files within a partition.  Each PDF becomes a DocRow
+    // that captures normalized text plus derived metadata.
     val docsDS: Dataset[DocRow] = raw.mapPartitions { it =>
       val stripper = new PDFTextStripper()
       stripper.setSortByPosition(true)
@@ -386,6 +407,8 @@ object IncrementalDatabasePipeline extends Serializable {
     // this makes sure that in the event that this exists
     if(hasWork) {
       // 4) Deterministic chunking
+      // Deterministic chunking ensures a stable chunkId for identical text so
+      // we avoid re-embedding on future runs when only chunk ordering changes.
       val chunkedDF: DataFrame = toProcessDF.as[DocRow].mapPartitions { it =>
         it.flatMap { doc =>
           val pieces = Chunker.split(doc.text)
@@ -438,6 +461,8 @@ object IncrementalDatabasePipeline extends Serializable {
       // =========================
       // 5) SELECT MISSING VECTORS
       // =========================
+      // Join against existing embeddings to figure out which chunkIds need new
+      // vectors for the requested embedder/version pair.
       val existingEmbKeys: DataFrame =
         if (pathExists(spark, paths.embedsPath))
           spark.read.parquet(paths.embedsPath)
@@ -463,6 +488,9 @@ object IncrementalDatabasePipeline extends Serializable {
             .select($"docId", $"chunkId", $"chunkText", $"chunkIx", $"shard")
             .as[(String, String, String, Int, Long)]
 
+        // Embedding work is grouped into small batches per partition.  Doing
+        // it here keeps Ollama calls close to the data and allows us to reuse
+        // HTTP clients instead of thrashing them for every chunk.
         val embDS: Dataset[EmbRow] = toEmbedDS.mapPartitions { rows =>
           val client    = new Ollama()
           val batchSize = 64
@@ -655,6 +683,9 @@ object IncrementalDatabasePipeline extends Serializable {
       .where(col("docId").isin(changedDocIds:_*))
       .select("docId", "chunkId", "embedding", "embDim")
 
+    // Only re-materialize the subset of the retrieval index that references
+    // the docIds modified in this run.  The rest of the parquet files are left
+    // untouched which keeps reruns fast.
     val changedIndexDF = latestChangedChunks
       .join(emb, Seq("docId", "chunkId"))
       .select(
