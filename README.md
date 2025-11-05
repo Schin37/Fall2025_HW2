@@ -31,7 +31,7 @@ sbt clean compile test
 
 ### Walkthrough link
 ```text
-https://youtu.be/7UWk9HDR3M4?si=b_YZ-D1rGpUSW2-H
+https://www.youtube.com/watch?v=vMO3dKZH0k4
 ```
 
 ### 1️⃣ Add/Update Context (Incremental Snapshot)
